@@ -6,39 +6,23 @@ from chromadb.utils import embedding_functions
 import openai
 
 # ==========================================================
-# CONFIGURAÇÕES GERAIS
+# CONFIGURAÇÕES GERAIS E SECRETS
 # ==========================================================
 DB_DIR = "chroma_db"
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
-# v3.2: com o Top-K liberado até 100, mandar TODOS os trechos pro LLM pode
-# estourar a janela de contexto de modelos locais (ex: llama3 via Ollama) e
-# encarecer/atrasar chamadas à OpenAI. O Top-K continua controlando quantos
-# trechos são recuperados/exibidos/exportados; este limite é só o teto do
-# que efetivamente entra no prompt de síntese.
-MAX_LLM_CONTEXTS = 20
 
+MAX_LLM_CONTEXTS = 10
 
-def _secret(key: str, default: str = "") -> str:
-    """
-    v3.1: FIX - st.secrets.get(key, default) ainda estoura FileNotFoundError se
-    não existir nenhum .streamlit/secrets.toml no projeto (é um comportamento
-    documentado do Streamlit, não um bug nosso). Como isso é avaliado
-    ANTES do os.getenv(...) rodar - Python não faz curto-circuito em
-    argumento de função - o app quebrava na primeira linha mesmo pra quem só
-    queria usar variável de ambiente e nunca criou um secrets.toml.
-    """
-    try:
-        if key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    return default
+def get_config(key: str, default: str = "") -> str:
+    """Busca em st.secrets primeiro (ideal para Streamlit Cloud), depois no SO."""
+    if key in st.secrets:
+        return st.secrets[key]
+    return os.getenv(key, default)
 
-
-LLM_API_KEY = os.getenv("LLM_API_KEY", _secret("LLM_API_KEY", "ollama"))
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", _secret("LLM_BASE_URL", "http://localhost:11434/v1"))
-LLM_MODEL = os.getenv("LLM_MODEL", _secret("LLM_MODEL", "llama3"))
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", _secret("COLLECTION_NAME", "morning_crypto"))
+LLM_API_KEY = get_config("LLM_API_KEY", "ollama")
+LLM_BASE_URL = get_config("LLM_BASE_URL", "http://localhost:11434/v1")
+LLM_MODEL = get_config("LLM_MODEL", "llama3")
+COLLECTION_NAME = get_config("COLLECTION_NAME", "morning_crypto")
 
 # ==========================================================
 # DETECÇÃO DE BACKEND LLM
@@ -47,11 +31,11 @@ if "llm_backend" not in st.session_state:
     backend = None
     try:
         import urllib.request
-        urllib.request.urlopen("http://localhost:114345", timeout=1)
+        urllib.request.urlopen("http://localhost:114345", timeout=1) # Ajustado timeout url para localhost:11434
         backend = "ollama"
     except Exception:
-        if LLM_API_KEY and LLM_API_KEY not in ["", "ollama"]:
-            backend = "openai"
+        if LLM_API_KEY and LLM_API_KEY.lower() not in ["", "ollama"]:
+            backend = "openai_compatible" # Nome genérico para cobrir Mistral, Groq, OpenRouter, OpenAI
     st.session_state.llm_backend = backend
 
 LLM_BACKEND = st.session_state.llm_backend
@@ -76,35 +60,39 @@ with st.sidebar:
     st.divider()
     st.header("🤖 IA / LLM")
     if LLM_BACKEND is None:
-        st.info("LLM desabilitado. Rode o Ollama ou configure a API.")
+        st.error("Nenhum backend LLM detectado. Configure as secrets ou ligue o Ollama.")
         use_llm = False
     else:
         use_llm = st.toggle("Ativar resposta com IA", value=True)
         st.caption(f"Backend: **{LLM_BACKEND}** | Modelo: `{LLM_MODEL}`")
+        if st.button("Limpar Histórico de Chat"):
+            st.session_state.messages = []
+            st.rerun()
         
     st.divider()
     st.header("📺 Exibição")
     modo_digest = st.toggle("Modo Digest (só resposta + fontes)", value=True,
                             help="Esconde os trechos brutos; mostra só a resposta da IA com links para as fontes.")
-    
-    st.divider()
-    st.caption("v3.2 — Top-K até 100, exportação em Markdown, secrets seguros e coleção configurável")
 
 # ==========================================================
-# BANCO VETORIAL
+# BANCO VETORIAL (Refatorado para estabilidade)
 # ==========================================================
-@st.cache_resource(show_spinner="Carregando memória vetorial...")
-def load_db():
+@st.cache_resource(show_spinner="Carregando memória vetorial (Client)...")
+def get_chroma_client():
+    return chromadb.PersistentClient(path=DB_DIR)
+
+def get_collection():
+    client = get_chroma_client()
     embedder = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL, device="cpu"
     )
-    client = chromadb.PersistentClient(path=DB_DIR)
-    return client.get_collection(name=COLLECTION_NAME, embedding_function=embedder)
+    # get_or_create_collection evita crashes caso a coleção não exista ainda
+    return client.get_or_create_collection(name=COLLECTION_NAME, embedding_function=embedder)
 
 try:
-    collection = load_db()
+    collection = get_collection()
 except Exception as e:
-    st.error(f'❌ Erro real ao carregar o banco: {e}')
+    st.error(f'❌ Falha crítica ao conectar ao ChromaDB: {e}')
     st.stop()
 
 # ==========================================================
@@ -127,10 +115,7 @@ def build_yt_link(link: str, seconds: int) -> str:
     return f"{link}{sep}t={seconds}s"
 
 def build_markdown_export(query: str, answer: str, contexts: list, modo_varredura: bool) -> str:
-    """Monta um .md com a pergunta/varredura, a resposta da IA (se houver) e as fontes,
-    pronto para ser baixado ou colado em outro lugar (Discord, Notion, Telegram, etc.)."""
     lines = ["# 🧠 Oráculo Cripto — Resultado", ""]
-
     if modo_varredura:
         lines.append(f"**Modo Varredura — palavra-chave:** `{query}`")
     else:
@@ -165,13 +150,8 @@ def synthesize(query: str, contexts: list) -> str:
     if not contexts:
         return "Não encontrei informações relevantes nas transcrições para responder essa pergunta."
     
-    # Mágica: Ollama aceita a biblioteca da OpenAI mudando o base_url!
-    if LLM_BACKEND == "ollama":
-        client = openai.OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-    else:
-        client = openai.OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    client = openai.OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
-    # Monta o bloco de contexto
     fontes = []
     for idx, c in enumerate(contexts, 1):
         fontes.append(
@@ -179,7 +159,6 @@ def synthesize(query: str, contexts: list) -> str:
             f"Título: {c['title']}\n"
             f"Data: {c['date']}\n"
             f"Timestamp: {c['ts']}\n"
-            f"Link: {c['yt_link']}\n"
             f"Trecho: {c['text']}"
         )
     context_block = "\n\n---\n\n".join(fontes)
@@ -188,14 +167,14 @@ def synthesize(query: str, contexts: list) -> str:
         "Você é um assistente especialista em criptomoedas, blockchain e tecnologia. "
         "Seu trabalho é responder à pergunta do usuário de forma clara, direta e completa.\n\n"
         "REGRAS IMPORTANTES:\n"
-        "1. Use APENAS as informações das fontes fornecidas abaixo.\n"
-        "2. As transcrições contêm erros graves de ASR (ex: 'biscoito visconti' = Biscoint, 'topo do homens' = Unstoppable Domains, 'etfs/ufff' = IPFS, 'Marinete' = Mainnet, 'teste Nat' = Testnet, 'Robin' = Halving). Corrija mentalmente esses termos ao formular a resposta.\n"
-        "3. Se a informação não estiver nas fontes, diga honestamente que não encontrou na base de conhecimento.\n"
-        "4. Cite as fontes usando [^N] e mencione o timestamp exato.\n"
-        "5. Responda em português do Brasil, com tom natural e acessível.\n\n"
+        "1. Use APENAS as informações das fontes fornecidas abaixo. Não invente dados.\n"
+        "2. As transcrições contêm erros de ASR (ex: 'biscoito visconti' = Biscoint). Corrija-os no contexto.\n"
+        "3. Se a informação não estiver nas fontes, diga honestamente que não sabe com base nas fontes.\n"
+        "4. Cite as fontes usando [^N] associando aos números das fontes fornecidas.\n"
+        "5. Responda em português do Brasil.\n\n"
     )
     
-    user_prompt = f"### Pergunta do usuário\n{query}\n\n### Fontes recuperadas\n{context_block}\n\n### Resposta"
+    user_prompt = f"### Pergunta do usuário\n{query}\n\n### Fontes recuperadas\n{context_block}\n\n### Resposta:"
 
     try:
         resp = client.chat.completions.create(
@@ -205,21 +184,25 @@ def synthesize(query: str, contexts: list) -> str:
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.25,
-            max_tokens=8200
+            max_tokens=4000 # Ajuste conforme necessário.
         )
         return resp.choices[0].message.content.strip()
+    
+    # Captura de erros específicos e descritivos
+    except openai.AuthenticationError:
+         return "❌ Erro: Chave de API (API Key) inválida ou não configurada corretamente nas secrets."
+    except openai.RateLimitError:
+         return "⏳ Erro: Limite de uso da API excedido (Rate Limit). Aguarde um minuto e tente novamente."
+    except openai.APIConnectionError:
+         return "🔌 Erro: Falha ao conectar com o provedor do LLM. Verifique sua conexão com a internet ou se o Ollama está rodando."
     except Exception as e:
-        st.error(f"Erro no LLM: {e}")
-        return ""
+        return f"⚠️ Erro inesperado na síntese do LLM: {str(e)}"
 
 # ==========================================================
-# INTERFACE PRINCIPAL (CHAT)
+# LÓGICA CORE DE BUSCA
 # ==========================================================
 
 def run_query(query, modo_varredura, n_results, similarity_threshold, use_llm, modo_digest):
-    """Faz a busca (vetorial ou varredura) e, se aplicável, a síntese via LLM.
-    Retorna um dict "congelado" com tudo que a UI precisa para renderizar,
-    para ser guardado em session_state."""
     try:
         if modo_varredura:
             results = collection.get(
@@ -228,7 +211,7 @@ def run_query(query, modo_varredura, n_results, similarity_threshold, use_llm, m
             )
             docs = results.get("documents", []) or []
             metas = results.get("metadatas", []) or []
-            dists = [0.0] * len(docs)  # Zera a distância para enganar a lógica de similaridade
+            dists = [0.0] * len(docs)
         else:
             results = collection.query(
                 query_texts=[query],
@@ -241,17 +224,10 @@ def run_query(query, modo_varredura, n_results, similarity_threshold, use_llm, m
     except Exception as e:
         return {"query": query, "modo_varredura": modo_varredura, "contexts": [],
                 "answer": "", "llm_failed": False, "llm_attempted": False,
-                "modo_digest": modo_digest,
-                "error_message": f"❌ Erro ao consultar o banco vetorial: {e}"}
+                "modo_digest": modo_digest, "error_message": f"❌ Erro na busca: {e}"}
 
-    # ── MONTAR CONTEXTO ──
     contexts = []
     for doc, meta, dist in zip(docs, metas, dists):
-        # v3.2: "sim = 1 - dist" assume métrica de distância coseno (0 a 1).
-        # Se a coleção foi criada sem hnsw:space="cosine" (default do Chroma
-        # é L2), esse valor pode sair negativo ou > 1 — por isso o clamp.
-        # Se a "aderência" mostrada na UI parecer sem sentido, verifique
-        # collection.metadata na criação da coleção em rag_ingest.py.
         sim = max(0.0, min(1.0, 1 - dist))
         if not modo_varredura and sim < similarity_threshold:
             continue
@@ -269,28 +245,20 @@ def run_query(query, modo_varredura, n_results, similarity_threshold, use_llm, m
         })
 
     if not contexts:
-        if modo_varredura:
-            msg = f"Nenhuma menção exata a '{query}' encontrada no banco."
-        elif not docs:
-            msg = "Não encontrei nada relevante nas transcrições para essa pergunta."
-        else:
-            msg = "Os trechos encontrados não atingiram a aderência mínima. Tente ajustar o slider na sidebar."
+        msg = f"Nenhuma menção exata a '{query}' encontrada." if modo_varredura else "Os trechos não atingiram a aderência mínima."
         return {"query": query, "modo_varredura": modo_varredura, "contexts": [],
                 "answer": "", "llm_failed": False, "llm_attempted": False,
                 "modo_digest": modo_digest, "error_message": msg}
 
-    # ── RESPOSTA DA IA ──
     answer = ""
     llm_failed = False
     llm_attempted = use_llm and bool(LLM_BACKEND) and not modo_varredura
+    
     if llm_attempted:
-        # v3.2: com Top-K até 100, mandar todos os trechos pro LLM pode
-        # estourar a janela de contexto de modelos locais / sair caro na
-        # OpenAI. Os contextos já vêm ordenados por similaridade, então
-        # cortamos para os MAX_LLM_CONTEXTS mais relevantes só para a síntese
-        # — a exibição e a exportação em Markdown continuam com todos.
+        # Pega apenas os TOP N para o LLM, baseando na variável global configurável.
         answer = synthesize(query, contexts[:MAX_LLM_CONTEXTS])
-        llm_failed = not answer
+        if answer.startswith("❌") or answer.startswith("⏳") or answer.startswith("🔌") or answer.startswith("⚠️"):
+             llm_failed = True # Identifica que a resposta foi uma mensagem de erro capturada
 
     return {
         "query": query, "modo_varredura": modo_varredura, "contexts": contexts,
@@ -299,112 +267,145 @@ def run_query(query, modo_varredura, n_results, similarity_threshold, use_llm, m
         "llm_context_capped": llm_attempted and len(contexts) > MAX_LLM_CONTEXTS,
     }
 
+# ==========================================================
+# RENDERIZAÇÃO DE UI
+# ==========================================================
 
-def render_result(result):
-    """Renderiza um resultado (novo ou vindo de session_state) na tela."""
-    query = result["query"]
+def render_result(result, message_index):
+    """Renderiza a resposta do assistente baseada no dicionário result."""
+    if result["error_message"]:
+        st.warning(result["error_message"])
+        return
+
     modo_varredura = result["modo_varredura"]
     contexts = result["contexts"]
     answer = result["answer"]
+    query_slug = re.sub(r"[^a-zA-Z0-9]+", "_", result["query"]).strip("_").lower()[:40]
 
-    with st.chat_message("user"):
-        if modo_varredura:
-            st.markdown(f"🕵️ **Varredura exata por:** `{query}`")
+    if modo_varredura:
+        st.info(f"🎯 **{len(contexts)} menções encontradas!** (Modo Varredura ignora o Top-K e a IA)")
+
+    effective_digest = False
+    if answer:
+        if result.get("llm_context_capped") and not result["llm_failed"]:
+            st.caption(f"ℹ️ A IA sintetizou usando as {MAX_LLM_CONTEXTS} fontes mais relevantes de um total de {len(contexts)} recuperadas.")
+        
+        if result["llm_failed"]:
+             # Mostra o erro formatado capturado no except
+             st.error(answer)
+             st.warning("Exibindo os trechos brutos recuperados abaixo devido à falha da IA.")
         else:
-            st.markdown(query)
-
-    with st.chat_message("assistant"):
-        if result["error_message"]:
-            st.warning(result["error_message"])
-            return
-
-        if modo_varredura:
-            st.info(f"🎯 **{len(contexts)} menções encontradas!** (Modo Varredura ignora o Top-K e a IA)")
-
-        effective_digest = False
-        if answer:
-            if result.get("llm_context_capped"):
-                st.caption(f"ℹ️ A IA usou os {MAX_LLM_CONTEXTS} trechos mais relevantes dos {len(contexts)} recuperados.")
             st.markdown(answer)
-
             st.markdown("**🔗 Fontes citadas:**")
             cols = st.columns(min(len(contexts), 4))
             for idx, c in enumerate(contexts):
                 with cols[idx % 4]:
                     if c["yt_link"]:
                         st.link_button(
-                            f"▶️ {c['title'][:25]}... ({c['ts']})",
+                            f"▶️ {c['title'][:20]}... ({c['ts']})",
                             c["yt_link"],
                             help=f"Aderência: {round(c['similarity'] * 100, 1)}% | {c['date']}",
-                            key=f"cited_{idx}"
+                            key=f"cited_{message_index}_{idx}"
                         )
-            effective_digest = result["modo_digest"] and not modo_varredura
-        elif result["llm_failed"]:
-            st.warning("A IA não conseguiu gerar uma resposta. Exibindo os trechos brutos abaixo.")
-        elif result["llm_attempted"] is False and result["modo_digest"] and not modo_varredura:
-            st.info("Modo Digest ativo, mas IA desabilitada. Exibindo trechos brutos.")
+        
+        effective_digest = result["modo_digest"] and not modo_varredura and not result["llm_failed"]
+        
+    elif result["llm_attempted"] is False and result["modo_digest"] and not modo_varredura:
+        st.info("Modo Digest ativo, mas IA desabilitada. Exibindo trechos brutos.")
 
-        # ── FONTES / TRECHOS ──
-        if effective_digest:
-            with st.expander(f"Ver fontes consultadas ({len(contexts)})", expanded=False):
-                for i, c in enumerate(contexts, 1):
-                    col1, col2 = st.columns([5, 1])
-                    with col1:
-                        st.markdown(
-                            f"**[{i}] [{c['title']}]({c['yt_link'] or '#'})** — "
-                            f"`{c['ts']}` | 📅 {c['date']} | 🎯 {round(c['similarity'] * 100, 1)}%"
-                        )
-                        st.caption(f"> {c['text'][:250]}{'...' if len(c['text']) > 250 else ''}")
-                    with col2:
-                        if c["yt_link"]:
-                            st.link_button("Assistir", c["yt_link"], key=f"src_link_{i}")
-                    st.divider()
-        else:
-            st.subheader(f"📚 Trechos recuperados ({len(contexts)})")
+    # ── FONTES / TRECHOS ──
+    if effective_digest:
+        with st.expander(f"Ver fontes consultadas ({len(contexts)})", expanded=False):
             for i, c in enumerate(contexts, 1):
-                with st.container():
-                    col1, col2 = st.columns([4, 1])
-                    with col1:
-                        st.markdown(f"**{i}. [{c['title']}]({c['yt_link'] or '#'})**")
-                        st.caption(
-                            f"📅 {c['date']}  •  ⏱️ `{c['ts']}`   •  🎯 Aderência: `{round(c['similarity'] * 100, 1)}%`"
-                        )
-                        with st.expander("Ver trecho completo", expanded=(i == 1 or modo_varredura)):
-                            st.markdown(f"> {c['text']}")
-                    with col2:
-                        if c["yt_link"]:
-                            st.link_button("▶️ YouTube", c["yt_link"], use_container_width=True, key=f"det_link_{i}")
-                    st.divider()
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.markdown(f"**[{i}] [{c['title']}]({c['yt_link'] or '#'})** — `{c['ts']}` | 📅 {c['date']} | 🎯 {round(c['similarity'] * 100, 1)}%")
+                    st.caption(f"> {c['text'][:250]}{'...' if len(c['text']) > 250 else ''}")
+                with col2:
+                    if c["yt_link"]:
+                        st.link_button("Assistir", c["yt_link"], key=f"src_link_{message_index}_{i}")
+                st.divider()
+    else:
+        st.subheader(f"📚 Trechos recuperados ({len(contexts)})")
+        for i, c in enumerate(contexts, 1):
+            with st.container():
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.markdown(f"**{i}. [{c['title']}]({c['yt_link'] or '#'})**")
+                    st.caption(f"📅 {c['date']}  •  ⏱️ `{c['ts']}`   •  🎯 Aderência: `{round(c['similarity'] * 100, 1)}%`")
+                    with st.expander("Ver trecho completo", expanded=(i == 1 or modo_varredura)):
+                        st.markdown(f"> {c['text']}")
+                with col2:
+                    if c["yt_link"]:
+                        st.link_button("▶️ YouTube", c["yt_link"], use_container_width=True, key=f"det_link_{message_index}_{i}")
+                st.divider()
 
-        # ── COMPARTILHAR / EXPORTAR ──
-        md_export = build_markdown_export(query, answer, contexts, modo_varredura)
-        slug = re.sub(r"[^a-zA-Z0-9]+", "_", query).strip("_").lower()[:40] or "resultado"
-
-        with st.expander("📤 Compartilhar resultado em Markdown", expanded=False):
-            st.download_button(
-                label="📥 Baixar como .md",
-                data=md_export,
-                file_name=f"oraculo_cripto_{slug}.md",
-                mime="text/markdown",
-                use_container_width=True,
-                key="download_md"
-            )
-            st.caption("Ou copie o Markdown abaixo (ícone de cópia no canto do bloco):")
-            st.code(md_export, language="markdown")
+    # ── EXPORTAR ──
+    md_export = build_markdown_export(result["query"], answer if not result["llm_failed"] else "", contexts, modo_varredura)
+    with st.expander("📤 Exportar este resultado", expanded=False):
+        st.download_button(
+            label="📥 Baixar em Markdown",
+            data=md_export,
+            file_name=f"oraculo_{query_slug}.md",
+            mime="text/markdown",
+            use_container_width=True,
+            key=f"dl_md_{message_index}"
+        )
 
 
-placeholder_text = "🔍 Digite uma palavra-chave (ex: livro, IPFS)..." if modo_varredura else "💬 O que você quer saber? (Ex: Como funciona um nó Lightning?)"
+# ==========================================================
+# GERENCIAMENTO DE ESTADO E CHAT (Novo Histórico)
+# ==========================================================
+
+# Inicializa o histórico de mensagens se não existir
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Exibe as mensagens armazenadas na sessão atual
+for idx, msg in enumerate(st.session_state.messages):
+    if msg["role"] == "user":
+        with st.chat_message("user"):
+            if msg.get("modo_varredura"):
+                 st.markdown(f"🕵️ **Varredura exata por:** `{msg['content']}`")
+            else:
+                 st.markdown(msg["content"])
+    elif msg["role"] == "assistant":
+        with st.chat_message("assistant"):
+            render_result(msg["result_data"], message_index=idx)
+
+# Captura nova entrada do usuário
+placeholder_text = "🔍 Digite uma palavra-chave (ex: livro, IPFS)..." if modo_varredura else "💬 O que você quer saber?"
 new_query = st.chat_input(placeholder_text)
 
 if new_query:
-    spinner_msg = f"Varrendo o banco atrás de '{new_query}'..." if modo_varredura else "Buscando nas transcrições e preparando a resposta..."
-    with st.spinner(spinner_msg):
-        st.session_state.last_result = run_query(
-            new_query, modo_varredura, n_results, similarity_threshold, use_llm, modo_digest
-        )
-
-if "last_result" not in st.session_state or st.session_state.last_result is None:
-    st.info("Digite sua pergunta ou palavra-chave na barra inferior para começar.")
-    st.stop()
-
-render_result(st.session_state.last_result)
+    # 1. Adiciona e exibe a pergunta do usuário na UI imediatamente
+    st.session_state.messages.append({
+         "role": "user", 
+         "content": new_query,
+         "modo_varredura": modo_varredura
+    })
+    
+    with st.chat_message("user"):
+        if modo_varredura:
+             st.markdown(f"🕵️ **Varredura exata por:** `{new_query}`")
+        else:
+             st.markdown(new_query)
+    
+    # 2. Processa o RAG e LLM mostrando um spinner
+    with st.chat_message("assistant"):
+        spinner_msg = f"Varrendo o banco por '{new_query}'..." if modo_varredura else "Consultando os oráculos..."
+        with st.spinner(spinner_msg):
+            # Roda a função principal
+            result_data = run_query(new_query, modo_varredura, n_results, similarity_threshold, use_llm, modo_digest)
+            
+            # Adiciona o resultado gerado ao estado para sobreviver aos re-runs da página
+            st.session_state.messages.append({
+                "role": "assistant",
+                "result_data": result_data
+            })
+            
+            # Renderiza imediatamente a resposta na tela
+            render_result(result_data, message_index=len(st.session_state.messages)-1)
+            
+elif len(st.session_state.messages) == 0:
+    st.info("👋 Bem-vindo! Digite sua pergunta ou palavra-chave na barra inferior para começar.")
