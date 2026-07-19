@@ -1,0 +1,23 @@
+# Ambientes Python
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Caches de modelo (recriados no build, não precisam ir pro repo)
+.cache/
+*.cache/
+
+# Segredos - NUNCA commitar chaves de API
+.streamlit/secrets.toml
+.env
+
+# Arquivos de trabalho locais (não usados pelo app publicado)
+audio_test/
+whisper_subs/
+processed_tracker.json
+*.mp3
+*.wav
+
+# Tracker de ingestão local (opcional manter, mas não é lido pelo app)

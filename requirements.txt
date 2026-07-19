@@ -1,0 +1,22 @@
+# requirements.txt para deploy do app_v33.py no Streamlit Community Cloud
+#
+# Versões testadas manualmente em 19/07/2026 (chromadb, streamlit e openai
+# rodando as chamadas reais usadas em app_v33.py: create_collection,
+# get_or_create_collection, add, upsert, query, delete_collection, e o
+# client openai.OpenAI com base_url customizado).
+#
+# sentence-transformers: versão mais recente confirmada no PyPI, mas NÃO
+# testada de ponta a ponta aqui (o torch que ela puxa é pesado demais pra
+# validar neste ambiente) — teste localmente com
+# `pip install -r requirements.txt` antes de fazer o deploy.
+#
+# A linha abaixo força o torch a instalar a build CPU-only (sem as libs da
+# NVIDIA/CUDA, que pesam ~2GB e são inúteis no Streamlit Cloud, que não tem
+# GPU). Isso reduz MUITO o tamanho do ambiente e ajuda a caber no limite de
+# 1GB de RAM do plano gratuito.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+streamlit==1.59.2
+chromadb==1.5.9
+openai==2.46.0
+sentence-transformers==5.6.0
