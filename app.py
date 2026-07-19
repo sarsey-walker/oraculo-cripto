@@ -11,7 +11,11 @@ import openai
 DB_DIR = "chroma_db"
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
-MAX_LLM_CONTEXTS = 10
+# Busca o limite de contextos do secrets. Se falhar ou estiver vazio, usa 7 por padrão.
+try:
+    MAX_LLM_CONTEXTS = int(get_config("MAX_LLM_CONTEXTS", "7"))
+except ValueError:
+    MAX_LLM_CONTEXTS = 7
 
 def get_config(key: str, default: str = "") -> str:
     """Busca em st.secrets primeiro (ideal para Streamlit Cloud), depois no SO."""
